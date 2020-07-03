@@ -1,5 +1,9 @@
-use rustc_hash::FxHashMap;
+#![feature(test)]
+extern crate test;
+
+use rustc_hash::{FxHashMap, FxHasher};
 use std::cmp::max;
+use std::hash::BuildHasherDefault;
 
 static mut TOTAL_EVAL: usize = 0;
 
@@ -312,6 +316,11 @@ impl Board {
             }
         }
 
+        // それ以外で全てのマスに石が置かれていたらもう引き分け
+        if self.0.count_ones() == 25 {
+            return State::Draw;
+        }
+
         // 一つ止めフリー3
         // 自分が3つ並んでいて、片方の端だけが止められているならゴール
         for &(line, line_end) in LINE3 {
@@ -344,13 +353,20 @@ impl Board {
             return State::P2;
         }
 
-        if self.0.count_ones() == 25 {
-            return State::Draw;
+        // 続行したとして望みがあるかどうかを確認。
+        // 4 のうち一つでも完成しうるかどうかを確認する。
+        for &line in LINE {
+            if (self.0 & line).count_ones() == 0 || ((self.0 >> 1) & line).count_ones() == 0 {
+                return State::None;
+            }
         }
 
-        State::None
+        // いずれの 4 も両方の石が侵入しているならもはや選びようがないのでドロー。
+        State::Draw
     }
 
+    // WARNING: この実装は全探索にならない！！たとえばもともと 4 つしかない列に free-2 があっても、
+    // 今すぐに対応しなければいけないわけではない。
     fn has_free2(self, cur_player: State) -> Option<((usize, usize), (usize, usize))> {
         let mut line2 = [None; 2];
         #[allow(clippy::needless_range_loop)]
@@ -379,7 +395,7 @@ impl Board {
     }
 
     fn eval(mut self, memo: &mut FxHashMap<Board, Eval>, depth: usize) -> Eval {
-        if depth > 7 {
+        if depth > 11 {
             return Eval::new(0);
         }
 
@@ -387,22 +403,11 @@ impl Board {
             println!("evaluating at depth {} of board {:050b}", depth, self.0);
         }
 
-        // 単に胸像・回転したものは同じとみなす。
-        for _ in 0..2 {
-            for _ in 0..4 {
-                // この局面が保存してあるなら OK
-                if let Some(&eval) = memo.get(&self) {
-                    return eval;
-                }
-                self = self.rotate_90();
-            }
-            self = self.mirrored();
-        }
-
         unsafe {
             TOTAL_EVAL += 1;
         }
 
+        // 先に判定（メモリ節約なるか？）
         let current = State::from(((depth & 1) + 1) as u64);
         let settled = self.settled(current);
         if settled != State::None {
@@ -414,15 +419,26 @@ impl Board {
                 -1
             };
 
-            let eval = Eval::new(value);
-            memo.insert(self, eval);
-            return eval;
+            return Eval::new(value);
+        }
+
+        // 再帰する前にすでに現れたかどうかチェック。単に鏡像・回転したものは同じとみなす。
+        for _ in 0..2 {
+            for _ in 0..4 {
+                // この局面が保存してあるならそれを取得
+                if let Some(&eval) = memo.get(&self) {
+                    return eval;
+                }
+                self = self.rotate_90();
+            }
+            self = self.mirrored();
         }
 
         let mut value = -1;
+        // 終了するかどうかを返す。
         let mut evaluator = |y: usize, x: usize| {
             if !self.is_available(y, x) {
-                return;
+                return false;
             }
 
             let next = self.set(y, x, current);
@@ -430,15 +446,21 @@ impl Board {
 
             // 自分必勝かどうかは次相手が必敗かどうかなので反転する。
             value = max(value, -eval.value);
+
+            // 終了するかどうか
+            value == 1
         };
 
         if let Some((start, end)) = self.has_free2(current) {
-            evaluator(start.0, start.1);
-            evaluator(end.0, end.1);
+            if !evaluator(start.0, start.1) {
+                evaluator(end.0, end.1);
+            }
         } else {
-            for y in 0..5 {
+            'outer: for y in 0..5 {
                 for x in 0..5 {
-                    evaluator(y, x);
+                    if evaluator(y, x) {
+                        break 'outer;
+                    }
                 }
             }
         }
@@ -513,6 +535,66 @@ fn test_board() {
     assert_eq!(board.settled(State::P2), State::P2);
 }
 
+#[bench]
+fn bench_board_set(b: &mut test::Bencher) {
+    b.iter(|| {
+        for _ in 0..1_000_000 {
+            let mut board = Board::new();
+            for i in 0..5 {
+                for j in 0..5 {
+                    board = test::black_box(board.set(i, j, State::from(((i + j) & 1) as u64)));
+                }
+            }
+        }
+    });
+}
+
+#[bench]
+fn bench_board_get(b: &mut test::Bencher) {
+    b.iter(|| {
+        for _ in 0..1_000_000 {
+            let board = Board::new();
+            for i in 0..5 {
+                for j in 0..5 {
+                    test::black_box(board.get(i, j));
+                }
+            }
+        }
+    });
+}
+
+#[bench]
+fn bench_board_rotate(b: &mut test::Bencher) {
+    b.iter(|| {
+        let mut board = Board::new();
+        for i in 0..5 {
+            for j in 0..5 {
+                board = board.set(i, j, State::from(((i + j) & 1) as u64));
+            }
+        }
+
+        for _ in 0..1_000_000 {
+            board = test::black_box(board.rotate_90());
+        }
+    })
+}
+
+#[bench]
+fn bench_board_mirror(b: &mut test::Bencher) {
+    b.iter(|| {
+        let mut board = Board::new();
+        for i in 0..5 {
+            for j in 0..5 {
+                board = board.set(i, j, State::from(((i + j) & 1) as u64));
+            }
+        }
+
+        for _ in 0..1_000_000 {
+            board = test::black_box(board.mirrored());
+        }
+    })
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 struct Eval {
     value: i8,
@@ -526,10 +608,13 @@ impl Eval {
 
 fn main() {
     let mut board = Board::new();
-    let mut memo = FxHashMap::default();
+    let mut memo = FxHashMap::with_capacity_and_hasher(
+        1_000_000_000,
+        BuildHasherDefault::<FxHasher>::default(),
+    );
 
     board = board.set(2, 2, State::P1);
-    board = board.set(2, 1, State::P2);
+    board = board.set(1, 1, State::P2);
     let eval = board.eval(&mut memo, 0);
     println!("Result: {} ({})", eval.value, unsafe { TOTAL_EVAL });
 
